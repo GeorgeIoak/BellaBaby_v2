@@ -112,6 +112,8 @@ volatile unsigned char 	key_press;		// key press detect
 volatile unsigned char 	key_rpt;		// key long press and repeat
 volatile uint8_t 		tick;			// Used for longer delay
 volatile uint8_t 		charging;		// Charging Flag
+volatile uint8_t 		asleep;			// Asleep Flag
+volatile uint8_t 		gotosleep;		// Go to sleep Flag
 
 
 // Init hardware.
@@ -119,6 +121,13 @@ volatile uint8_t 		charging;		// Charging Flag
 
 static inline void init_hardware(void)
 {
+	// Main Clock source: Calibrated Internal 8 MHz Osc.
+	CCP=0xd8;
+	CLKMSR=(0<<CLKMS1) | (0<<CLKMS0);
+	// Clock Prescaler division factor: 8
+	CCP=0xd8;
+	CLKPSR=(0<<CLKPS3) | (0<<CLKPS2) | (1<<CLKPS1) | (1<<CLKPS0);
+
 	// Port A initialization
 
 	// Pull-up initialization:
@@ -171,8 +180,16 @@ void tim0_setup(void) // Timer0 setup, not used
 
 void tim1_setup(void) // Timer1 setup for debounce
 {
-	TCCR1B |= (1 << CS11); 					// 8MHz/8/8 = 1MHz
-	OCR1A = 612; 							// 1249/2 - fudge->> 10ms timer
+	if (asleep)
+	{
+		TCCR1B = (1 << CS10); 				// 8MHz/256/1 = 31,250Hz
+		OCR1A = 130; 						// 312/2 - fudge->> 10ms timer
+	}
+	else {
+		TCCR1B = (1 << CS11); 				// 8MHz/8/8 = 125kHz
+		OCR1A = 612; 						// 1249/2 - fudge->> 10ms timer
+	}
+
 	TIMSK |= (1 << OCIE1A); 				// enable T1 interrupt
 	TCCR1B |= (1 << WGM12); 				// Mode 4: CTC
 }
@@ -310,69 +327,105 @@ unsigned char  get_key_long(unsigned char key_mask )
 
 void sleepy_time(void)
 {
-	cli();
-	PUEA &= ~(1<<PUEA3) | ~(1<<PUEA2);		// Disable pull-ups to save power
-	//DDRA &= ~(1 << PINA4) | ~(1 << PINA5) | ~(1 << PINA7) | ~(1 << PINA6); // PA6 is test pin
-	DDRA &= ~(LED_MASK) | ~(1 << PINA6);	// Change to inputs
-	PORTA &= ~(LED_MASK) | ~(1 << PINA6);	// Set pins low
-	init_button_int();						// Setup pin change int
-	set_sleep_mode(SLEEP_MODE_PWR_DOWN);	
+	cli();									// Disable global interrupts
+	DDRA  = 0b10000000;						// All inputs except PA7
+	//PUEA &= ~(1 << PUEA3) | ~(1 << PUEA2);	// Disable pull-ups to save power
+	PUEA |= (1 << PUEA6) | (1 << PUEA3) | (1 << PUEA2) | (1 << PUEA1); // Enable Pull-ups on unused pins
+	PORTA &= ~(LED_MASK) | ~(1 << PINA6) | ~(1 << PINA1) | ~(1 << PINA0);	// Set pins low
+	//DDRA  &= ~(LED_MASK) | ~(1 << PINA6);	// Change to inputs
+
+	PUEB = (1 << PUEB3) | (1 << PUEB2) | (1 << PUEB1) | (1 << PUEB0); // Enabling lowers power for some reason
+	PORTB = (0 << PORTB3) | (1 << PORTB2) | (0 << PORTB1) | (0 << PORTB0);	// Don't pull PB2 low it has external Pull-up
+	DDRB = 0;								// All Port B to Inputs
+	DIDR0 = 0xFF; 							// Disable Digital Input Buffers to conserve power
+	CCP = 0xD8;								// Write signature to allow frequency change
+	CLKPSR = (1 << CLKPS3);					// Set CPU Clock to /256, must be within 4 clocks of CCP
+
+	PRR |= (1 << PRTWI) | (1 << PRSPI) | (0 << PRTIM1) | (1 << PRTIM0) | (1 << PRADC);	//Shut 'em down
+	ADCSRA &= ~(1 << ADEN);					// Disable ADC to save power
+	ACSRA |= (1 << ACD);					// Switch off the Analog Comparator
+	asleep = 1;								// I'm going to sleep now
+	init_button_int();						// Need to enable again
+	tim1_setup();	
+	set_sleep_mode(SLEEP_MODE_IDLE);		// 673uA power level @ F_CPU=8MHz/8
 	sleep_enable();
-	sei();
+	sei();									// Enable global interrupts
+	CCP = 0xD8;								// Write signature to allow frequency change
+	MCUCR |= (1 << BODS);					// Disable Brown Out Detect, but didn't lower power
 	sleep_cpu();
 	sleep_disable();
-	tim1_setup();
-	//_delay_ms(100); //Wait arbitrary amount of time so button doesn't get read upon resuming execution
 }
 
-int main (void)
+void wakeup_time(void)
 {
 	init_hardware();						// General I/O Configuration
+	asleep = 0;
+	DIDR0 = 0;								// Enable Digital Input Buffers
+	PRR = (1 << PRTWI) | (1 << PRSPI) | (0 << PRTIM1) | (0 << PRTIM0) | (0 << PRADC);	// 0 Enables them
+	CCP = 0xD8;								// Write signature to allow frequency change
+	CLKPSR = (1 << CLKPS1) | (1 << CLKPS0);	// Set CPU Clock to /8, must be within 4 clocks of CCP
 	tim1_setup();							// Used for the debounce routine
 	adc_setup();							// Measure Vcc for battery check
 	pwm_setup();							// LED String Brightness Control
 	suart_init();							// Used for debugging
+}
 
-	OCR0B = 0;								// Controls the duty cycle
-	OCR0A = 255;							// Sets the total PWM cycle	
+int main (void)
+{
+	wakeup_time();							// Initialize everything
+	init_button_int();
 
 	// Start with LEDs OFF
 	LED_RED_OFF;							// Low Battery Indicator
 	LED_GREEN_OFF;							// Charging
 	LED_LIGHT_OFF;							// LED Light String
-	int16_t step = 0;						// Used to cycle through brightness
-	uint16_t brightness[4] = {0,85,170,255};
+	int16_t step = 1;						// Used to cycle through brightness
+	uint16_t brightness[4] = {0,85,170,255};// Won't use 0 for now
 	uint16_t counter = 12000;				// Together w/ 10ms gives 1min
+
+	OCR0B = 0;								// Controls the duty cycle
+	OCR0A = 255;							// Sets the total PWM cycle	
 
 	sei();									// Enable global interrupts
 	sleepy_time();							// Start off sleeping
 
 	while (1)
 	{
-
-		if (get_key_short(1 << KEY1))
+		if (!asleep)						// Ignore short if asleep
 		{
-			step++;
-			byte_to_usart_in_decimal(step);
-			byte_to_usart_in_decimal(9); 	// End of xfer flag
-
-			if (step == 4)
+			if (get_key_short(1 << KEY1))
 			{
-				step = 0;
-				pwm_write(brightness[step]);
-				_delay_ms(100);				// Need time to turn OFF LEDs
-				sleepy_time();
-			}
-			else {
-				pwm_write(brightness[step]);
+				step++;
+				byte_to_usart_in_decimal(step);
+				byte_to_usart_in_decimal(9); 	// End of xfer flag
+
+				if (step == 4)
+				{
+					//step = 0;
+					step = 1;
+					pwm_write(brightness[step]);
+					//_delay_ms(50);				// Need time to turn OFF LEDs
+					//gotosleep = 1;
+				}
+				else {
+					pwm_write(brightness[step]);
+				}
 			}
 		}
 
 		if (get_key_long(1 << KEY1))
 		{
-			pwm_write(0);
-			step = 0;
-			sleepy_time();
+			if (asleep) 					// Was I asleep?
+			{
+				wakeup_time();				// Time to wake up
+				//LED_GREEN_ON;				// Just testing
+				pwm_write(brightness[step]);// Turn on LEDs at the last level
+			}
+			else { 
+				pwm_write(0);				// Turn OFF the LEDs
+				_delay_ms(50);				// Need time to turn OFF LEDs
+				gotosleep = 1;
+			}
 		}
 
 		if (tick)
@@ -380,10 +433,16 @@ int main (void)
 			tick = 0;
 			if(--counter == 0)				// Time to check battery level
 			{
-				set_LEDs(readVcc());
+				//set_LEDs(readVcc());
 				counter = 12000;			// Reset 1min timer
 			}
 
+		}
+
+		if (gotosleep)
+		{
+			gotosleep = 0;
+			sleepy_time();
 		}
 	}// End while
 	return 0;
@@ -394,6 +453,7 @@ int main (void)
 ISR(TIM1_COMPA_vect)						// Button Debouncer
 {
 	TCNT1 = 0;
+	PORTA ^= (1 << PINA6);					//Toggle test pin
 	DebounceSwitch();
 	tick = 1;								// 10ms passed flag
 }
@@ -417,6 +477,7 @@ ISR(PCINT0_vect)							// Battery Charger Response
 		LED_GREEN_ON; 						// Good power plugged in
 		LED_RED_ON; 						// Indicate charging
 		charging = 1;
+		wakeup_time();
 	}
 	else
 	{
@@ -434,7 +495,19 @@ ISR(PCINT0_vect)							// Battery Charger Response
 
 ISR(PCINT1_vect)
 {
-	//sleep_disable();
-	//GIMSK &= ~(1<<PCIE1); 			// Disable the interrupt so it doesn't keep flagging
-  	//PCMSK1 &= ~(1<<PCINT10);
+	if (asleep)								// Were we asleep
+	{
+		//asleep = 0;							// You woke me up!
+		//DebounceSwitch();
+		//wakeup_time();
+		//LED_GREEN_ON;
+	}
+	else {
+		//DebounceSwitch();
+	}
+	//wakeup_time();
+	//LED_RED_SWAP;					// Just testing
+		
+	GIMSK &= ~(1<<PCIE1); 			// Disable the interrupt so it doesn't keep flagging
+  	PCMSK1 &= ~(1<<PCINT10);
 }
